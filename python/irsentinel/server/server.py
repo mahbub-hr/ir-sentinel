@@ -1,19 +1,33 @@
 # server.py
-from mcp.server.fastmcp import FastMCP
-from compiler import LLVMCompiler
-import json
-import os
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
+from fastmcp import FastMCP
+from compiler import LLVMCompiler
+# import json
+# import os
+# from langchain_google_genai import ChatGoogleGenerativeAI
+# from dotenv import load_dotenv
+
+# load_dotenv()  # Load environment variables from .env file
 # Initialize MCP Server
 mcp = FastMCP("IR-Sentinel")
 compiler = LLVMCompiler()
 
-# Initialize LLM (Gemini Free Tier)
-# Ensure GOOGLE_API_KEY is in .env
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+# llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+
+@mcp.tool
+def greet(name:str) -> str:
+    """Returns a friendly greeting"""
+    return f"Hello {name}! Its a pleasure to connect from your first MCP Server."
+
+
+@mcp.tool
+def compile(source_code: str) -> str:
+    """Compiles C source code to LLVM IR and returns the IR as a string."""
+    try:
+        ir = compiler.compile_to_ir(source_code, "temp")
+        return ir
+    except Exception as e:
+        return f"Compilation error: {str(e)}"
 
 @mcp.tool()
 def analyze_patch_security(vuln_code: str, patched_code: str) -> str:
@@ -60,4 +74,4 @@ def analyze_patch_security(vuln_code: str, patched_code: str) -> str:
         return f"Error during analysis: {str(e)}"
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="http", port="8080")
