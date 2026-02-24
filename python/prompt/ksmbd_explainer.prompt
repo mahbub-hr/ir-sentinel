@@ -1,0 +1,18 @@
+The code is for the Linux kernel's SMB server implementation. There are two components:
+
+- The kernel component which accepts SMB connections and processes them.
+- A user-space component (ksmbd-tools) which is used to handle RPC calls, certain parts of the authentication process and
+  some other functionality.
+
+The kernel component uses netlink IPC to call the user-space component. The user-space component is a trusted component.
+Assume that it's responses are not malicious, unless the attacker can force malicious responses by controlling IPC
+arguments from the kernel side to the user-space side.
+
+Attackers can connect to the kernel component using TCP. ksmbd spawns new kernel threads to handle connections and
+concurrent processing is possible. I have provided you with the kernel source code for connection handling, work processing,
+and the handling of SMB session setup requests.
+
+The code for the kernel component is in the kernel/ directory, while the code for the user-space component (which handles
+IPC calls from the kernel component) is in the ksmbd-tools/ directory.
+
+The user-space component is a trusted component. It may return errors, but it will not return malicious responses.

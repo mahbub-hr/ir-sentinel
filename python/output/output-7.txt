@@ -1,0 +1,65 @@
+After auditing the provided source code for the `smb2_sess_setup` command and its associated functions in the `ksmbd` kernel SMB server, I have identified the following security vulnerability:
+
+### Out-of-Bounds Read in `ntlm_negotiate`
+
+A vulnerability exists in the `ntlm_negotiate` function (found in `smb2pdu.c`) where a crafted SMB2 Session Setup request can trigger an out-of-bounds read.
+
+#### Technical Details
+In `smb2_sess_setup`, the server extracts the security buffer (the NTLMSSP blob) from the request:
+
+```c
+// smb2pdu.c: smb2_sess_setup
+negblob_off = le16_to_cpu(req->SecurityBufferOffset);
+negblob_len = le16_to_cpu(req->SecurityBufferLength);
+// ... validation of offset ...
+negblob = (struct negotiate_message *)((char *)&req->hdr.ProtocolId + negblob_off);
+```
+
+If the message type is `NtLmNegotiate`, it calls `ntlm_negotiate`:
+
+```c
+// smb2pdu.c: ntlm_negotiate
+static int ntlm_negotiate(struct ksmbd_work *work,
+                          struct negotiate_message *negblob,
+                          size_t negblob_len, struct smb2_sess_setup_rsp *rsp)
+{
+    // ...
+    rc = ksmbd_decode_ntlmssp_neg_blob(negblob, negblob_len, work->conn);
+    if (rc)
+        return rc;
+
+    // ... (if use_spnego is true)
+    sz = sizeof(struct challenge_message);
+    sz += (strlen(ksmbd_netbios_name()) * 2 + 1 + 4) * 6;
+
+    neg_blob = kzalloc(sz, KSMBD_DEFAULT_GFP);
+    // ...
+    chgblob = (struct challenge_message *)neg_blob;
+    sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn);
+    // ...
+    rc = build_spnego_ntlmssp_neg_blob(&spnego_blob, &spnego_blob_len, neg_blob, sz);
+    // ...
+    memcpy(rsp->Buffer, spnego_blob, spnego_blob_len); // <--- Potential OOB Read
+    rsp->SecurityBufferLength = cpu_to_le16(spnego_blob_len);
+    // ...
+}
+```
+
+The vulnerability lies in the `memcpy` into `rsp->Buffer`. The `rsp` pointer is derived from `work->response_buf` via the `WORK_BUFFERS` macro. The size of the response buffer is allocated earlier in the processing pipeline (typically in `smb2_allocate_rsp_buf`, though the allocation logic is not fully shown, the `work->response_sz` is used to track its limits).
+
+In `ntlm_negotiate`, when `SPNEGO` is used, the code calculates a size for `neg_blob`, builds a challenge, and then wraps it in a SPNEGO ASN.1 wrapper via `build_spnego_ntlmssp_neg_blob`. However, there is **no check** to ensure that the resulting `spnego_blob_len` fits within the allocated `rsp->Buffer`. 
+
+While `ksmbd` generally allocates `SMB3_MAX_MSGSIZE` (around 4KB) for responses, the `ntlm_negotiate` function does not verify the remaining space in the response buffer before performing the `memcpy`. If an attacker provides a request that results in a large `spnego_blob_len` (though limited here by the hardcoded `sz` calculation), or if this is part of a **compounded request**, the `rsp->Buffer` might be positioned near the end of the allocated memory.
+
+#### Impact
+An attacker can cause a heap-based out-of-bounds write. Since this occurs during the session setup phase, it can be triggered by an unauthenticated user. This could lead to a kernel crash (Denial of Service) or potentially remote code execution.
+
+#### Recommendation
+The `ntlm_negotiate` and `ntlm_authenticate` functions should verify that `spnego_blob_len` does not exceed the remaining capacity of the response buffer. Specifically, it should check against `work->response_sz` minus the offset of `rsp->Buffer`.
+
+### Additional Observation: Potential Information Leak in `ksmbd_decode_ntlmssp_auth_blob`
+In `auth.c`, the `ksmbd_decode_ntlmssp_auth_blob` function performs a `memcmp` on the NTLMSSP signature:
+```c
+if (memcmp(authblob->Signature, "NTLMSSP", 8)) { ... }
+```
+While not a direct memory safety violation, if the `blob_len` provided is exactly `sizeof(struct authenticate_message)`, but the actual data in the buffer is shorter, this could read past the end of the received network buffer. However, `ksmbd_conn_handler_loop` in `connection.c` ensures that the `request_buf` is allocated based on the `pdu_size` and that the read from the transport is complete, which mitigates this in most scenarios.

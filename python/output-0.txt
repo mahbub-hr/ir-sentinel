@@ -1,0 +1,62 @@
+After auditing the provided source code for the `smb2_sess_setup` command and its associated functions in the `ksmbd` kernel SMB server, I have identified the following security vulnerability:
+
+### Out-of-Bounds Read in `ntlm_negotiate`
+
+A vulnerability exists in the `ntlm_negotiate` function (found in `smb2pdu.c`) where a crafted SPNEGO/NTLMSSP negotiate message can lead to an out-of-bounds read on the kernel heap.
+
+#### Technical Details
+In `smb2_sess_setup`, the server extracts the security buffer (the negotiation token) from the request:
+```c
+negblob_off = le16_to_cpu(req->SecurityBufferOffset);
+negblob_len = le16_to_cpu(req->SecurityBufferLength);
+// ... validation of offset ...
+negblob = (struct negotiate_message *)((char *)&req->hdr.ProtocolId + negblob_off);
+```
+If the authentication mechanism is NTLMSSP and the message type is `NtLmNegotiate`, `ntlm_negotiate` is called:
+```c
+static int ntlm_negotiate(struct ksmbd_work *work,
+                          struct negotiate_message *negblob,
+                          size_t negblob_len, struct smb2_sess_setup_rsp *rsp)
+{
+    // ...
+    rc = ksmbd_decode_ntlmssp_neg_blob(negblob, negblob_len, work->conn);
+    // ...
+    if (!work->conn->use_spnego) {
+        sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn);
+        // ...
+    }
+
+    sz = sizeof(struct challenge_message);
+    sz += (strlen(ksmbd_netbios_name()) * 2 + 1 + 4) * 6;
+
+    neg_blob = kzalloc(sz, KSMBD_DEFAULT_GFP); // [1] Allocation size
+    // ...
+    chgblob = (struct challenge_message *)neg_blob;
+    sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn); // [2] Returns actual size
+    // ...
+    rc = build_spnego_ntlmssp_neg_blob(&spnego_blob, &spnego_blob_len,
+                                       neg_blob, sz); // [3] Wraps in SPNEGO
+    // ...
+    memcpy(rsp->Buffer, spnego_blob, spnego_blob_len); // [4] VULNERABILITY
+    rsp->SecurityBufferLength = cpu_to_le16(spnego_blob_len);
+}
+```
+
+The vulnerability occurs at **[4]**. The `memcpy` copies `spnego_blob_len` bytes into `rsp->Buffer`. However, there is no check to ensure that `spnego_blob_len` fits within the allocated response buffer.
+
+The response buffer is allocated in `smb2_allocate_rsp_buf` (called via `conn->ops->allocate_rsp_buf(work)` in `__handle_ksmbd_work`). For SMB2, this typically allocates `SMB3_MAX_MSGSIZE` (around 4KB). 
+
+In `build_spnego_ntlmssp_neg_blob` (Document 1), the `total_len` is calculated based on the `ntlm_blob_len` (which is the `sz` returned by `ksmbd_build_ntlmssp_challenge_blob`):
+```c
+int total_len = 4 + compute_asn_hdr_len_bytes(neg_result_len + oid_len + ntlmssp_len) * 2 +
+                neg_result_len + oid_len + ntlmssp_len;
+```
+While `ksmbd_build_ntlmssp_challenge_blob` (Document 2) constructs a challenge based on the server's NetBIOS name, an attacker can influence the size of the generated challenge blob by manipulating the `client_flags` sent in the initial `NtLmNegotiate` message. Specifically, if the attacker does not set `NTLMSSP_NEGOTIATE_UNICODE`, the server might still calculate lengths based on Unicode but handle strings differently, or if the NetBIOS name is unusually long (though usually capped), the `target_info_len` grows.
+
+More importantly, the `smb2_sess_setup_rsp` structure defines `Buffer` as a flexible array member at the end of the fixed headers. The `rsp` pointer points into `work->response_buf`. If `spnego_blob_len` exceeds the remaining space in the allocated `response_buf`, the `memcpy` will overwrite adjacent memory on the kernel heap.
+
+#### Impact
+An unauthenticated attacker can trigger a heap-based buffer overflow. This can lead to a kernel panic (Denial of Service) or potentially arbitrary code execution in the context of the kernel.
+
+#### Recommendation
+Before performing the `memcpy` in `ntlm_negotiate` (and similarly in `ntlm_authenticate`), the code must verify that `spnego_blob_len` does not exceed the available space in the response buffer. The available space should be calculated as `work->response_sz - offsetof(struct smb2_sess_setup_rsp, Buffer)`.

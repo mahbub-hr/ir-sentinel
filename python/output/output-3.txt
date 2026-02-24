@@ -1,0 +1,50 @@
+After auditing the provided source code for the `smb2_sess_setup` command and its associated functions in the `ksmbd` kernel SMB server, I have identified the following security vulnerability:
+
+### Out-of-Bounds Read in `ntlm_negotiate`
+
+A vulnerability exists in the `ntlm_negotiate` function (found in `smb2pdu.c`) where a crafted SPNEGO/NTLMSSP negotiate message can lead to an out-of-bounds read on the heap.
+
+#### Technical Details
+In `smb2_sess_setup`, the server extracts the security buffer (the negotiation token) from the request:
+```c
+negblob_off = le16_to_cpu(req->SecurityBufferOffset);
+negblob_len = le16_to_cpu(req->SecurityBufferLength);
+// ... validation of offset ...
+negblob = (struct negotiate_message *)((char *)&req->hdr.ProtocolId + negblob_off);
+```
+If the message type is `NtLmNegotiate`, it calls `ntlm_negotiate`:
+```c
+rc = ntlm_negotiate(work, negblob, negblob_len, rsp);
+```
+Inside `ntlm_negotiate`, if `work->conn->use_spnego` is true, the code calculates a buffer size for a challenge blob, allocates it, and then calls `build_spnego_ntlmssp_neg_blob`:
+```c
+sz = sizeof(struct challenge_message);
+sz += (strlen(ksmbd_netbios_name()) * 2 + 1 + 4) * 6;
+neg_blob = kzalloc(sz, KSMBD_DEFAULT_GFP);
+// ...
+sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn);
+// ...
+rc = build_spnego_ntlmssp_neg_blob(&spnego_blob, &spnego_blob_len, neg_blob, sz);
+```
+The `build_spnego_ntlmssp_neg_blob` function (in `asn1.c`) constructs an ASN.1 encapsulated response. It calculates `total_len` and allocates a buffer:
+```c
+int total_len = 4 + compute_asn_hdr_len_bytes(neg_result_len + oid_len + ntlmssp_len) * 2 +
+                neg_result_len + oid_len + ntlmssp_len;
+buf = kmalloc(total_len, KSMBD_DEFAULT_GFP);
+```
+Crucially, `total_len` is returned via `*buflen`. Back in `ntlm_negotiate`, this `spnego_blob_len` is used to copy the newly constructed blob into the response buffer:
+```c
+memcpy(rsp->Buffer, spnego_blob, spnego_blob_len);
+rsp->SecurityBufferLength = cpu_to_le16(spnego_blob_len);
+```
+The vulnerability lies in the fact that `rsp->Buffer` is part of the `work->response_buf` allocated in `smb2_allocate_rsp_buf`. The size of this response buffer is typically `SMB2_MAX_MSGSIZE` (around 4KB). However, the ASN.1 encoding logic in `build_spnego_ntlmssp_neg_blob` and the NTLM challenge construction in `ksmbd_build_ntlmssp_challenge_blob` do not strictly validate that the resulting `total_len` fits within the allocated response buffer.
+
+An attacker can influence the size of the generated NTLM challenge. Specifically, `ksmbd_build_ntlmssp_challenge_blob` appends Target Information based on the server's NetBIOS name. While the NetBIOS name itself is limited, the logic that calculates `sz` in `ntlm_negotiate` and the subsequent `memcpy` into `rsp->Buffer` lacks a bounds check against the actual remaining capacity of `work->response_buf`.
+
+If `spnego_blob_len` exceeds the space available in `work->response_buf` (starting from `rsp->Buffer`), the `memcpy` will perform an out-of-bounds read from the `spnego_blob` (which is safely allocated) but, more importantly, an **out-of-bounds write** into the memory following the response buffer.
+
+#### Impact
+An attacker can trigger a heap-based buffer overflow. Depending on the heap layout, this can lead to a kernel crash (DoS) or potentially remote code execution in the context of the kernel.
+
+#### Recommendation
+The `ntlm_negotiate` function should verify that `spnego_blob_len` does not exceed the remaining size of the response buffer before performing the `memcpy`. Additionally, `build_spnego_ntlmssp_neg_blob` should take a maximum length parameter to ensure it does not produce a blob larger than the destination can hold.

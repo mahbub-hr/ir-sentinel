@@ -1,0 +1,67 @@
+After auditing the provided source code for the `smb2_sess_setup` command and its associated functions in the `ksmbd` kernel SMB server, I have identified the following security vulnerability:
+
+### Out-of-Bounds Read in `ntlm_negotiate`
+
+A vulnerability exists in the `ntlm_negotiate` function (found in `smb2pdu.c`) where a crafted SPNEGO/NTLMSSP negotiate message can lead to an out-of-bounds read on the heap.
+
+#### Technical Details
+In `smb2_sess_setup`, the server extracts the security buffer (the negotiation token) from the request:
+```c
+negblob_off = le16_to_cpu(req->SecurityBufferOffset);
+negblob_len = le16_to_cpu(req->SecurityBufferLength);
+// ... validation of offset ...
+negblob = (struct negotiate_message *)((char *)&req->hdr.ProtocolId + negblob_off);
+```
+If the message type is `NtLmNegotiate`, it calls `ntlm_negotiate`:
+```c
+rc = ntlm_negotiate(work, negblob, negblob_len, rsp);
+```
+Inside `ntlm_negotiate`, if `work->conn->use_spnego` is true, the code calculates a buffer size `sz` to hold a challenge message and associated NetBIOS names, allocates it, and then calls `ksmbd_build_ntlmssp_challenge_blob`:
+```c
+sz = sizeof(struct challenge_message);
+sz += (strlen(ksmbd_netbios_name()) * 2 + 1 + 4) * 6;
+neg_blob = kzalloc(sz, KSMBD_DEFAULT_GFP);
+// ...
+chgblob = (struct challenge_message *)neg_blob;
+sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn);
+```
+The vulnerability lies in the subsequent call to `build_spnego_ntlmssp_neg_blob`:
+```c
+rc = build_spnego_ntlmssp_neg_blob(&spnego_blob, &spnego_blob_len, neg_blob, sz);
+```
+And inside `build_spnego_ntlmssp_neg_blob` (in `asn1.c`):
+```c
+memcpy(rsp->Buffer, spnego_blob, spnego_blob_len);
+rsp->SecurityBufferLength = cpu_to_le16(spnego_blob_len);
+```
+The `spnego_blob` is allocated based on `total_len`, which is calculated using `ntlm_blob_len` (the `sz` returned from the challenge builder). However, the resulting `spnego_blob` is then copied into `rsp->Buffer` in `ntlm_negotiate`:
+```c
+memcpy(rsp->Buffer, spnego_blob, spnego_blob_len);
+```
+The `rsp` (Response) buffer is allocated in `smb2_allocate_rsp_buf` (called via `conn->ops->allocate_rsp_buf(work)` in `server.c`). For SMB2, this typically allocates a fixed size (e.g., `MAX_CIFS_SMALL_BUFFER_SIZE` or similar, usually around 4KB). 
+
+The vulnerability occurs because `ntlm_negotiate` does not verify if `spnego_blob_len` exceeds the remaining space in the `work->response_buf`. While the `challenge_message` itself is relatively small, the ASN.1 encoding and the inclusion of multiple Target Information blocks (NetBIOS name, DNS name, etc.) in `ksmbd_build_ntlmssp_challenge_blob` increase the size. 
+
+More importantly, in `ntlm_authenticate`, a similar pattern occurs:
+```c
+authblob = user_authblob(conn, req);
+// ...
+rc = ksmbd_decode_ntlmssp_auth_blob(authblob, sz, conn, sess);
+```
+In `ksmbd_decode_ntlmssp_auth_blob`, the code processes the `SessionKey`:
+```c
+sess_key_off = le32_to_cpu(authblob->SessionKey.BufferOffset);
+sess_key_len = le16_to_cpu(authblob->SessionKey.Length);
+if (blob_len < (u64)sess_key_off + sess_key_len)
+        return -EINVAL;
+// ...
+cifs_arc4_crypt(ctx_arc4, sess->sess_key, (char *)authblob + sess_key_off, sess_key_len);
+```
+If an attacker provides a large `SecurityBufferLength` in the `SMB2_SESSION_SETUP` request, and `conn->use_spnego` is active, the `blob_len` (passed as `sz`) is used to validate offsets. If the attacker manipulates `SessionKey.BufferOffset` to point outside the actual received network data but within the `blob_len` range, `cifs_arc4_crypt` will read from out-of-bounds memory relative to the request buffer.
+
+#### Impact
+An attacker can cause a Denial of Service (Kernel OOPS) by triggering an out-of-bounds read or potentially leak sensitive kernel memory if they can observe the encrypted session key or the resulting response blobs.
+
+#### Recommendation
+1.  In `ntlm_negotiate` and `ntlm_authenticate`, validate that the generated `spnego_blob_len` does not exceed the allocated response buffer size.
+2.  In `ksmbd_decode_ntlmssp_auth_blob`, ensure that all `BufferOffset` and `Length` fields are validated against the actual bounds of the received request PDU, not just the `SecurityBufferLength` field provided by the client.

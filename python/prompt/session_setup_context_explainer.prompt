@@ -1,0 +1,8 @@
+ksmbd has too much code for it all to fit in your context window in one go.
+Therefore you are going to audit each SMB command in turn. Commands are
+handled by the __process_request function from server.c, which selects a
+command from the conn->cmds list and calls it. We are currently auditing the
+smb2_sess_setup command. The code context you have been given includes all of
+the work setup code code up to the __process_request function, the
+smb2_sess_setup function and a breadth first expansion of smb2_sess_setup up
+to a depth of 3 function calls.

@@ -1,0 +1,49 @@
+After auditing the provided source code for the `smb2_sess_setup` command and its associated functions in the `ksmbd` kernel SMB server, I have identified the following security vulnerability:
+
+### Out-of-Bounds Read in `ntlm_negotiate`
+
+A vulnerability exists in the `ntlm_negotiate` function (found in `smb2pdu.c`) where a crafted SPNEGO/NTLMSSP negotiate message can lead to an out-of-bounds read on the heap.
+
+#### Technical Details
+In `smb2_sess_setup`, the server extracts the security buffer (the negotiation token) from the request:
+```c
+negblob_off = le16_to_cpu(req->SecurityBufferOffset);
+negblob_len = le16_to_cpu(req->SecurityBufferLength);
+// ... validation of offset ...
+negblob = (struct negotiate_message *)((char *)&req->hdr.ProtocolId + negblob_off);
+```
+If the message type is `NtLmNegotiate`, it calls `ntlm_negotiate`:
+```c
+rc = ntlm_negotiate(work, negblob, negblob_len, rsp);
+```
+Inside `ntlm_negotiate`, if `work->conn->use_spnego` is true, the code calculates a buffer size `sz` for a challenge message and its associated target information, allocates `neg_blob`, and then calls `ksmbd_build_ntlmssp_challenge_blob`:
+```c
+sz = sizeof(struct challenge_message);
+sz += (strlen(ksmbd_netbios_name()) * 2 + 1 + 4) * 6;
+neg_blob = kzalloc(sz, KSMBD_DEFAULT_GFP);
+// ...
+chgblob = (struct challenge_message *)neg_blob;
+sz = ksmbd_build_ntlmssp_challenge_blob(chgblob, work->conn);
+```
+The vulnerability occurs immediately after this in the call to `build_spnego_ntlmssp_neg_blob`:
+```c
+rc = build_spnego_ntlmssp_neg_blob(&spnego_blob, &spnego_blob_len, neg_blob, sz);
+```
+In `asn1.c`, `build_spnego_ntlmssp_neg_blob` uses `memcpy` to copy the `neg_blob` into a newly allocated SPNEGO wrapper:
+```c
+/* insert response token - ntlmssp blob */
+encode_asn_tag(buf, &ofs, 0xa2, 0x04, ntlm_blob_len);
+memcpy(buf + ofs, ntlm_blob, ntlm_blob_len); // ntlm_blob_len is 'sz' from ntlm_negotiate
+```
+The issue is that `ksmbd_build_ntlmssp_challenge_blob` (in `auth.c`) calculates the length of the challenge message based on the NetBIOS name and target information, but it returns this length as an `unsigned int`. If `ksmbd_build_ntlmssp_challenge_blob` returns an error code (like `-ENOMEM` or `-EINVAL`), the value is treated as a very large positive integer when passed to `build_spnego_ntlmssp_neg_blob` (which expects an `int ntlm_blob_len`).
+
+While `ntlm_negotiate` checks if `sz < 0`, the return type of `ksmbd_build_ntlmssp_challenge_blob` is `unsigned int`. In C, if a function returns `-ENOMEM` (typically `-12`), and the return type is `unsigned int`, the resulting value is `0xFFFFFFF4`. The check `if (sz < 0)` in `ntlm_negotiate` will fail because an unsigned integer is never less than zero.
+
+Consequently, `build_spnego_ntlmssp_neg_blob` will attempt to `memcpy` `0xFFFFFFF4` bytes from the `neg_blob` pointer, leading to a massive out-of-bounds read and a kernel panic (DoS) or potential information disclosure of kernel memory.
+
+#### Impact
+An unauthenticated attacker can trigger this by sending a specially crafted Session Setup request that causes `ksmbd_build_ntlmssp_challenge_blob` to return an error (for example, by forcing a failure in `smb_strtoUTF16`). This results in a denial of service (kernel oops/panic).
+
+#### Recommendation
+1. Change the return type of `ksmbd_build_ntlmssp_challenge_blob` from `unsigned int` to `int` to correctly propagate error codes.
+2. Ensure that all callers of functions returning lengths check for negative error values before passing those lengths to memory manipulation functions like `memcpy`.
