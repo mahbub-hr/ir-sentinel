@@ -14,7 +14,7 @@ compiler = LLVMCompiler("./build/StatsCollector.so")
 
 # llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 @mcp.tool
-def identify_complex_function() -> str:
+def identify_complex_functions() -> dict:
     ir_target = "ksmbd_module.ll" 
     # 2. Run Analysis
     print(f"Running LLVM Pass on {ir_target}...")
@@ -28,6 +28,8 @@ def identify_complex_function() -> str:
 
     complex_funcs = df[df['basic_blocks'] > 50].index.tolist()
     print(f"\n[Feed to LLM] Focused Research Candidates: {complex_funcs}")
+
+    return complex_funcs
 
 def construct_function_call_trace():
     # This is a placeholder for a function that would construct a call trace for a given function.
