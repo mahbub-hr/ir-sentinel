@@ -27,8 +27,7 @@ def identify_complex_functions() -> dict:
     print(df.sort_values(by="basic_blocks", ascending=False).head(5))
 
     complex_funcs = df[df['basic_blocks'] > 50].index.tolist()
-    print(f"\n[Feed to LLM] Focused Research Candidates: {complex_funcs}")
-
+    
     return complex_funcs
 
 def construct_function_call_trace():
